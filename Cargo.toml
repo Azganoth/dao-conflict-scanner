@@ -1,0 +1,17 @@
+[package]
+name = "dao-conflict-scanner"
+version = "1.0.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+egui = "0.31"
+eframe = "0.31"
+directories = "6.0"
+rfd = "0.15"
+indexmap = "2.8"
+walkdir = "2.5"
+pathdiff = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
