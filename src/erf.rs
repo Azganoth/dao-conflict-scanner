@@ -4,6 +4,16 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
+#[derive(Debug, thiserror::Error)]
+pub enum ErfError {
+    #[error("Invalid file header: expected {expected:?}, found {found:?}")]
+    InvalidHeader { expected: String, found: String },
+    #[error("Unsupported ERF version: {0}")]
+    UnsupportedVersion(String),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
 #[derive(Debug)]
 pub struct ErfFile {
     pub version: ErfVersion,
@@ -38,37 +48,36 @@ pub struct ResourceEntry {
 }
 
 impl ErfFile {
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, ErfError> {
         let mut file = File::open(path)?;
         Self::from_reader(&mut file)
     }
 
-    pub fn from_reader<R: Read + Seek>(reader: &mut R) -> io::Result<Self> {
-        let mut file_type = [0u8; 8];
-        let mut file_version = [0u8; 8];
-        reader.read_exact(&mut file_type)?;
-        reader.read_exact(&mut file_version)?;
+    fn from_reader<R: io::Read + io::Seek>(reader: &mut R) -> Result<Self, ErfError> {
+        let (file_type, file_version) = Self::read_header(reader)?;
 
-        if decode_utf16le(&file_type) != "ERF " {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid file type: {:?}", file_type),
-            ));
-        }
-
-        match decode_utf16le(&file_version).as_str() {
-            "V2.0" => ErfFile::parse(reader, ErfVersion::V20),
-            "V2.2" => ErfFile::parse(reader, ErfVersion::V22),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unsupported ERF version: {:?}", file_version),
-                ));
-            }
+        match (file_type.as_str(), file_version.as_str()) {
+            ("ERF ", "V2.0") => Self::parse(reader, ErfVersion::V20),
+            ("ERF ", "V2.2") => Self::parse(reader, ErfVersion::V22),
+            (_, version) => Err(ErfError::UnsupportedVersion(version.to_string())),
+            _ => Err(ErfError::InvalidHeader {
+                expected: "ERF ".to_string(),
+                found: file_type,
+            }),
         }
     }
 
-    fn parse<R: Read + Seek>(reader: &mut R, version: ErfVersion) -> io::Result<Self> {
+    fn read_header<R: io::Read>(reader: &mut R) -> Result<(String, String), ErfError> {
+        let mut header = [0u8; 16];
+        reader.read_exact(&mut header)?;
+
+        let file_type = decode_utf16le(&header[0..8]);
+        let file_version = decode_utf16le(&header[8..16]);
+
+        Ok((file_type, file_version))
+    }
+
+    fn parse<R: Read + Seek>(reader: &mut R, version: ErfVersion) -> Result<Self, ErfError> {
         // Read common header fields
         let mut header = [0u8; 16];
         reader.read_exact(&mut header)?;
@@ -122,7 +131,11 @@ impl ErfFile {
         })
     }
 
-    pub fn get_resource(&self, name: &str, reader: &mut (impl Read + Seek)) -> io::Result<Vec<u8>> {
+    pub fn get_resource(
+        &self,
+        name: &str,
+        reader: &mut (impl Read + Seek),
+    ) -> Result<Vec<u8>, ErfError> {
         let index = self.by_name.get(&name.to_lowercase()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -153,50 +166,8 @@ fn decode_utf16le(bytes: &[u8]) -> String {
     result
 }
 
-// Helper functions for reading primitives (same as before)
 fn read_u32(bytes: &[u8]) -> u32 {
     let mut buf = [0u8; 4];
     buf.copy_from_slice(bytes);
     u32::from_le_bytes(buf)
-}
-
-// Example usage updated for version handling
-fn main() -> io::Result<()> {
-    use std::env;
-    let args: Vec<String> = env::args().collect();
-
-    if args.len() < 2 {
-        eprintln!("Usage: {} <erf-file> [resource-name]", args[0]);
-        std::process::exit(1);
-    }
-
-    let erf = ErfFile::open(&args[1])?;
-
-    println!(
-        "ERF 2.{} File:",
-        match erf.version {
-            ErfVersion::V20 => "0",
-            ErfVersion::V22 => "2",
-        }
-    );
-    println!(
-        "Year: {}, Day: {}, Module ID: {}",
-        erf.year, erf.day, erf.module_id
-    );
-    println!("Resources ({}):", erf.toc.len());
-    for entry in &erf.toc {
-        println!(
-            "- {} (Packed: {} bytes, Unpacked: {} bytes)",
-            entry.name, entry.packed_length, entry.length
-        );
-    }
-
-    if args.len() > 2 {
-        let mut file = File::open(&args[1])?;
-        let data = erf.get_resource(&args[2], &mut file)?;
-        println!("\nResource '{}' contents ({} bytes):", args[2], data.len());
-        println!("{:02X?}", &data[..data.len().min(32)]);
-    }
-
-    Ok(())
 }

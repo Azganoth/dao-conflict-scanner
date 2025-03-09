@@ -22,7 +22,3 @@ pub fn open_location(path: &Path) -> io::Result<()> {
 pub fn get_bioware_dir() -> Option<PathBuf> {
     Some(UserDirs::new()?.document_dir()?.join("BioWare/Dragon Age"))
 }
-
-fn get_override_dir() -> Option<PathBuf> {
-    Some(get_bioware_dir()?.join("packages/core/override"))
-}
