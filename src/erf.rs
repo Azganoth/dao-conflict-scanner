@@ -1,17 +1,26 @@
 #![allow(dead_code)]
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{self, Read, Seek, SeekFrom},
+    path::Path,
+};
 
-#[derive(Debug, thiserror::Error)]
+use anyhow::{Context, Result as AnyhowResult};
+use thiserror::Error as ThisError;
+
+#[derive(Debug, ThisError)]
 pub enum ErfError {
     #[error("Invalid file header: expected {expected:?}, found {found:?}")]
     InvalidHeader { expected: String, found: String },
     #[error("Unsupported ERF version: {0}")]
     UnsupportedVersion(String),
-    #[error(transparent)]
+    #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    #[error("Invalid resource name: {0}")]
+    InvalidResourceName(String),
+    #[error("Invalid UTF-16 character in string")]
+    InvalidStringEncoding,
 }
 
 #[derive(Debug)]
@@ -47,38 +56,49 @@ pub struct ResourceEntry {
     pub length: u32,
 }
 
+pub type ErfResult<T> = Result<T, ErfError>;
+
 impl ErfFile {
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, ErfError> {
-        let mut file = File::open(path)?;
+    /// Open and parse an ERF file from the given path.
+    pub fn open<P: AsRef<Path>>(path: P) -> AnyhowResult<Self> {
+        let path = path.as_ref();
+        let mut file = File::open(path)
+            .with_context(|| format!("Failed to open ERF file at {}", path.display()))?;
+
         Self::from_reader(&mut file)
+            .with_context(|| format!("Failed to parse ERF file at {}", path.display()))
     }
 
-    fn from_reader<R: io::Read + io::Seek>(reader: &mut R) -> Result<Self, ErfError> {
-        let (file_type, file_version) = Self::read_header(reader)?;
+    /// Parse an ERF file from any readable and seekable source.
+    fn from_reader<R: Read + Seek>(reader: &mut R) -> ErfResult<Self> {
+        let (magic, version_str) = Self::read_header(reader)?;
 
-        match (file_type.as_str(), file_version.as_str()) {
-            ("ERF ", "V2.0") => Self::parse(reader, ErfVersion::V20),
-            ("ERF ", "V2.2") => Self::parse(reader, ErfVersion::V22),
-            (_, version) => Err(ErfError::UnsupportedVersion(version.to_string())),
-            _ => Err(ErfError::InvalidHeader {
+        match magic.as_str() {
+            "ERF " => match version_str.as_str() {
+                "V2.0" => Self::parse(reader, ErfVersion::V20),
+                "V2.2" => Self::parse(reader, ErfVersion::V22),
+                _ => Err(ErfError::UnsupportedVersion(version_str)),
+            },
+            other => Err(ErfError::InvalidHeader {
                 expected: "ERF ".to_string(),
-                found: file_type,
+                found: other.to_string(),
             }),
         }
     }
 
-    fn read_header<R: io::Read>(reader: &mut R) -> Result<(String, String), ErfError> {
+    /// Read the header fields from the file.
+    fn read_header<R: Read>(reader: &mut R) -> ErfResult<(String, String)> {
         let mut header = [0u8; 16];
         reader.read_exact(&mut header)?;
 
-        let file_type = decode_utf16le(&header[0..8]);
-        let file_version = decode_utf16le(&header[8..16]);
+        let magic = decode_utf16le(&header[0..8])?;
+        let version = decode_utf16le(&header[8..16])?;
 
-        Ok((file_type, file_version))
+        Ok((magic, version))
     }
 
-    fn parse<R: Read + Seek>(reader: &mut R, version: ErfVersion) -> Result<Self, ErfError> {
-        // Read common header fields
+    /// Parse the ERF structure after reading the header.
+    fn parse<R: Read + Seek>(reader: &mut R, version: ErfVersion) -> ErfResult<Self> {
         let mut header = [0u8; 16];
         reader.read_exact(&mut header)?;
 
@@ -91,34 +111,41 @@ impl ErfFile {
             0
         };
 
-        // Read TOC entries
         let mut toc = Vec::with_capacity(file_count as usize);
-        let mut by_name = HashMap::new();
+        let mut by_name = HashMap::with_capacity(file_count as usize);
 
-        for _ in 0..file_count {
-            let mut entry_data = [0u8; 72]; // 64 bytes name + 8 bytes data
+        for i in 0..file_count {
+            let entry_size = if version == ErfVersion::V22 { 76 } else { 72 };
+            let mut entry_data = vec![0u8; entry_size];
+
             reader.read_exact(&mut entry_data)?;
 
-            // Decode UTF-16LE name
-            let name_bytes = &entry_data[0..64];
-            let name = decode_utf16le(name_bytes)
+            let name = decode_utf16le(&entry_data[0..64])?
                 .trim_end_matches('\0')
                 .to_string();
 
+            if name.is_empty() {
+                return Err(ErfError::InvalidResourceName(format!(
+                    "Empty resource name in TOC at index {i}"
+                )));
+            }
+
             let offset = read_u32(&entry_data[64..68]);
-            let lengths = match version {
-                ErfVersion::V20 => (read_u32(&entry_data[68..72]), read_u32(&entry_data[68..72])),
-                ErfVersion::V22 => (read_u32(&entry_data[68..72]), read_u32(&entry_data[72..76])),
+            let packed_length = read_u32(&entry_data[68..72]);
+            let length = if version == ErfVersion::V22 {
+                read_u32(&entry_data[72..76])
+            } else {
+                packed_length
             };
 
             toc.push(ErfTocEntry {
                 name: name.clone(),
                 offset,
-                packed_length: lengths.0,
-                length: lengths.1,
+                packed_length,
+                length,
             });
 
-            by_name.insert(name.to_lowercase(), toc.len() - 1);
+            by_name.insert(name.to_lowercase(), i as usize);
         }
 
         Ok(Self {
@@ -131,39 +158,50 @@ impl ErfFile {
         })
     }
 
-    pub fn get_resource(
+    /// Retrieve a resource's data by name.
+    pub fn get_resource<R: Read + Seek>(
         &self,
         name: &str,
-        reader: &mut (impl Read + Seek),
-    ) -> Result<Vec<u8>, ErfError> {
-        let index = self.by_name.get(&name.to_lowercase()).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Resource not found: {}", name),
-            )
-        })?;
+        reader: &mut R,
+    ) -> AnyhowResult<Vec<u8>> {
+        let key = name.to_lowercase();
+        let index = self
+            .by_name
+            .get(&key)
+            .ok_or_else(|| ErfError::InvalidResourceName(name.to_string()))?;
 
         let entry = &self.toc[*index];
-        reader.seek(SeekFrom::Start(entry.offset as u64))?;
+        reader
+            .seek(SeekFrom::Start(entry.offset as u64))
+            .context("Failed to seek to resource offset")?;
+
         let mut data = vec![0u8; entry.length as usize];
-        reader.read_exact(&mut data)?;
+        reader
+            .read_exact(&mut data)
+            .context("Failed to read resource data")?;
 
         Ok(data)
     }
 }
 
-fn decode_utf16le(bytes: &[u8]) -> String {
-    let mut result = String::new();
-    let mut chunks = bytes.chunks_exact(2);
-
-    for chunk in &mut chunks {
-        let val = u16::from_le_bytes([chunk[0], chunk[1]]);
-        if val != 0 {
-            result.push(char::from_u32(val as u32).unwrap_or('�'));
-        }
+fn decode_utf16le(bytes: &[u8]) -> ErfResult<String> {
+    if bytes.len() % 2 != 0 {
+        return Err(ErfError::InvalidStringEncoding);
     }
 
-    result
+    let mut result = String::new();
+
+    for chunk in bytes.chunks_exact(2) {
+        let val = u16::from_le_bytes([chunk[0], chunk[1]]);
+        if val == 0 {
+            continue;
+        }
+
+        let c = char::from_u32(val as u32).ok_or(ErfError::InvalidStringEncoding)?;
+        result.push(c);
+    }
+
+    Ok(result)
 }
 
 fn read_u32(bytes: &[u8]) -> u32 {

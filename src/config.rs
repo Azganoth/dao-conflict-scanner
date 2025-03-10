@@ -1,9 +1,10 @@
-#![allow(dead_code)]
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{fs, path::PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result as AnyhowResult, anyhow};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+
+use crate::scanner::Conflicts;
 
 const QUALIFIER: &str = "com";
 const ORGANIZATION: &str = "Azlands";
@@ -11,43 +12,60 @@ const APPLICATION: &str = "DAO-Conflict-Scanner";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub ignored: HashMap<String, Vec<PathBuf>>,
+    pub ignored: Conflicts,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            ignored: HashMap::new(),
+            ignored: Conflicts::new(),
         }
     }
 }
 
 impl AppConfig {
+    /// Load the configuration from file or return the default configuration.
     pub fn load() -> Self {
-        Self::load_from_path().unwrap_or_default()
+        match Self::load_saved() {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("Warning: Could not load saved config. Using default. Details: {err}");
+                Self::default()
+            }
+        }
     }
 
-    fn load_from_path() -> Result<Self> {
-        let config_path = Self::config_path().context("Failed to determine config directory")?;
+    /// Save the current configuration to disk.
+    pub fn save(&self) -> AnyhowResult<()> {
+        let config_path = Self::config_file_path()?;
+        let contents =
+            toml::to_string_pretty(self).context("Failed to serialize AppConfig to TOML")?;
 
-        let contents = fs::read_to_string(&config_path).context("Failed to read config file")?;
+        if let Some(parent_dir) = config_path.parent() {
+            fs::create_dir_all(parent_dir).context("Failed to create config directory")?;
+        }
 
-        toml::from_str(&contents).context("Failed to parse config file")
-    }
-
-    pub fn save(&self) -> Result<()> {
-        let config_path = Self::config_path().context("Failed to determine config directory")?;
-
-        let contents = toml::to_string_pretty(self).context("Failed to serialize config")?;
-
-        fs::create_dir_all(config_path.parent().unwrap())?;
         fs::write(&config_path, contents).context("Failed to write config file")?;
 
         Ok(())
     }
 
-    fn config_path() -> Option<PathBuf> {
+    /// Internal: Attempt to load the configuration from disk.
+    fn load_saved() -> AnyhowResult<Self> {
+        let config_path = Self::config_file_path()?;
+        if !config_path.exists() {
+            return Err(anyhow!("Configuration file not found"));
+        }
+
+        let contents = fs::read_to_string(&config_path).context("Failed to read config file")?;
+
+        toml::from_str(&contents).context("Failed to parse TOML config")
+    }
+
+    /// Internal: Get the path to the configuration file.
+    fn config_file_path() -> AnyhowResult<PathBuf> {
         ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .map(|proj_dirs| proj_dirs.config_dir().join("config.toml"))
+            .ok_or_else(|| anyhow!("Could not determine configuration directory for the app"))
     }
 }

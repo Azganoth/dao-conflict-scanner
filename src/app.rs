@@ -1,40 +1,42 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::{io, mem, thread};
+use std::{mem, thread};
 
-use crate::config::AppConfig;
-use crate::scanner::{DuplicateGroups, find_duplicates};
-use crate::utils::{get_bioware_dir, open_location};
-use anyhow::Context;
+use anyhow::{Context, Result as AnyhowResult};
+use directories::UserDirs;
 use eframe::egui;
 use pathdiff::diff_paths;
 
+use crate::config::AppConfig;
+use crate::scanner::{Conflicts, ScanError, scan_for_conflicts};
+use crate::utils::{delete, open_in_explorer};
+
+const BUTTON_RADIUS: f32 = 3.0;
+
 fn setup_theme(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
-    let mut style = (*ctx.style()).clone();
-
-    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-    style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-    style.visuals.widgets.hovered.expansion = 0.0;
-
-    ctx.set_style(style);
+    ctx.style_mut(|style| {
+        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+        style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+        style.visuals.widgets.hovered.expansion = 0.0;
+    });
 }
 
 pub struct App {
     config: AppConfig,
-    duplicates: DuplicateGroups,
+    conflicts: Conflicts,
     status: String,
 
     scan_thread: Option<thread::JoinHandle<()>>,
-    receiver: Option<mpsc::Receiver<io::Result<DuplicateGroups>>>,
+    receiver: Option<mpsc::Receiver<Result<Conflicts, ScanError>>>,
     pending_commands: Vec<Command>,
-    marked_for_delition: Option<PathBuf>,
 }
 
 #[derive(Debug)]
 enum Command {
-    IgnoreGroup(String, Vec<PathBuf>),
-    UnignoreGroup(String),
+    IgnoreConflict(String, Vec<PathBuf>),
+    UnignoreConflict(String),
+    DeleteConflictFile(String, PathBuf),
 }
 
 impl App {
@@ -43,27 +45,28 @@ impl App {
 
         Self {
             config: AppConfig::load(),
-            duplicates: DuplicateGroups::new(),
-            status: "Waiting...".to_string(),
+            conflicts: Conflicts::new(),
+            status: "".to_string(),
             scan_thread: None,
             receiver: None,
             pending_commands: Vec::new(),
-            marked_for_delition: None,
         }
     }
 
-    fn start_scan(&mut self, bioware_dir: &PathBuf) {
+    fn start_scan(&mut self, bioware_dir: &Path) {
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
 
-        let game_dir = bioware_dir.clone();
+        let game_dir = bioware_dir.to_path_buf();
         self.scan_thread = Some(thread::spawn(move || {
-            let result = find_duplicates(&game_dir);
-            tx.send(result).unwrap();
+            let result = scan_for_conflicts(&game_dir);
+            tx.send(result).unwrap_or_else(|e| {
+                eprintln!("Failed to send scan result: {}", e);
+            });
         }));
 
         self.status = "Scanning...".to_string();
-        self.duplicates.clear();
+        self.conflicts.clear();
     }
 
     fn process_scan_results(&mut self) {
@@ -71,38 +74,35 @@ impl App {
             if let Ok(result) = receiver.try_recv() {
                 match result {
                     Ok(duplicates) => {
-                        self.duplicates = duplicates;
+                        self.conflicts = duplicates;
 
-                        // Cleanup ignored groups in-place
+                        // Remove old conflicts when new ones are found
                         self.config.ignored.retain(|key, ignored_paths| {
-                            match self.duplicates.get(key) {
-                                Some(current_paths) => {
-                                    let mut sorted_ignored = ignored_paths.clone();
-                                    let mut sorted_current = current_paths.clone();
-                                    sorted_ignored.sort();
-                                    sorted_current.sort();
-                                    sorted_ignored == sorted_current
-                                }
-                                None => false,
-                            }
+                            self.conflicts
+                                .get(key)
+                                .map_or(false, |paths| paths == ignored_paths)
                         });
 
-                        self.status = format!("Found {} duplicate groups", self.duplicates.len());
+                        self.status = format!("Found {} conflicts", self.conflicts.len());
 
-                        if let Err(e) = self.config.save() {
-                            self.status = format!("Config error: {}", e);
-                        }
+                        // Silently ignore
+                        self.config.save().unwrap_or_else(|e| {
+                            eprintln!("Config error: {}", e);
+                        });
                     }
                     Err(e) => {
-                        self.status = format!("Scan error: {}", e);
+                        self.status = format!("Scan failed: {}", e);
                     }
                 }
+
+                // Reset scan state
+                self.receiver.take();
                 self.scan_thread.take();
             }
         }
     }
 
-    fn handle_commands(&mut self) -> anyhow::Result<()> {
+    fn handle_commands(&mut self) -> AnyhowResult<()> {
         let commands = mem::take(&mut self.pending_commands);
         if commands.is_empty() {
             return Ok(());
@@ -110,13 +110,22 @@ impl App {
 
         for command in commands {
             match command {
-                Command::IgnoreGroup(key, paths) => {
-                    let mut sorted_paths = paths;
-                    sorted_paths.sort();
-                    self.config.ignored.insert(key, sorted_paths);
+                Command::IgnoreConflict(key, paths) => {
+                    self.config.ignored.insert(key, paths);
                 }
-                Command::UnignoreGroup(key) => {
+                Command::UnignoreConflict(key) => {
                     self.config.ignored.remove(&key);
+                }
+                Command::DeleteConflictFile(key, path) => {
+                    delete(&path).context(format!("Failed to delete {}", path.display()))?;
+
+                    // Update conflicts
+                    if let Some(paths) = self.conflicts.get_mut(&key) {
+                        paths.retain(|p| p != &path);
+                        if paths.is_empty() {
+                            self.conflicts.remove(&key);
+                        }
+                    }
                 }
             }
         }
@@ -124,41 +133,9 @@ impl App {
         self.config.save().context("Failed to save config")?;
         Ok(())
     }
-
-    fn is_group_ignored(&self, key: &str, paths: &[PathBuf]) -> bool {
-        self.config.ignored.get(key).map_or(false, |ignored_paths| {
-            let mut sorted_current = paths.to_vec();
-            let mut sorted_ignored = ignored_paths.clone();
-            sorted_current.sort();
-            sorted_ignored.sort();
-            sorted_current == sorted_ignored
-        })
-    }
 }
 
 impl App {
-    fn main_ui(&mut self, ui: &mut egui::Ui, bioware_dir: PathBuf) {
-        egui::TopBottomPanel::top("controls").show_inside(ui, |ui| {
-            self.scan_controls(ui, &bioware_dir);
-            ui.add_space(8.0);
-        });
-
-        egui::TopBottomPanel::bottom("ignored")
-            .min_height(200.0)
-            .show_inside(ui, |ui| {
-                ui.add_space(2.0);
-                self.ignored_panel(ui, &bioware_dir);
-            });
-
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("main_results")
-                .show(ui, |ui| {
-                    self.results_panel(ui, &bioware_dir);
-                });
-        });
-    }
-
     fn not_found_ui(&self, ui: &mut egui::Ui) {
         ui.with_layout(
             egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
@@ -174,13 +151,37 @@ impl App {
         );
     }
 
-    fn scan_controls(&mut self, ui: &mut egui::Ui, bioware_dir: &PathBuf) {
+    fn main_ui(&mut self, ui: &mut egui::Ui, bioware_dir: &Path) {
+        egui::TopBottomPanel::top("controls").show_inside(ui, |ui| {
+            self.scan_controls(ui, bioware_dir);
+            ui.add_space(8.0);
+        });
+
+        egui::TopBottomPanel::bottom("ignored").show_inside(ui, |ui| {
+            ui.add_space(8.0);
+            self.ignored_panel(ui, bioware_dir);
+        });
+
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("main_results")
+                .show(ui, |ui| {
+                    self.results_panel(ui, bioware_dir);
+                });
+        });
+    }
+
+    fn scan_controls(&mut self, ui: &mut egui::Ui, bioware_dir: &Path) {
         ui.horizontal(|ui| {
             ui.spacing_mut().button_padding = egui::vec2(24.0, 6.0);
 
             // Scan button
             if ui
-                .add(egui::Button::new(egui::RichText::new("🔍").size(24.0)))
+                .add_enabled(
+                    self.scan_thread.is_none(),
+                    egui::Button::new(egui::RichText::new("🔍").size(24.0))
+                        .corner_radius(BUTTON_RADIUS),
+                )
                 .on_hover_text("Start new scan")
                 .clicked()
             {
@@ -197,168 +198,264 @@ impl App {
         });
     }
 
-    fn ignored_panel(&mut self, ui: &mut egui::Ui, bioware_dir: &PathBuf) {
-        ui.heading(format!("Ignored Groups ({})", self.config.ignored.len()));
-        ui.add_space(4.0);
+    fn results_panel(&mut self, ui: &mut egui::Ui, bioware_dir: &Path) {
+        let mut filtered_conflicts: Vec<_> = self
+            .conflicts
+            .iter()
+            .filter_map(|(key, paths)| {
+                if self.config.ignored.get(key).map_or(false, |p| p == paths) {
+                    None
+                } else {
+                    Some((key.clone(), paths.clone()))
+                }
+            })
+            .collect();
 
-        egui::ScrollArea::vertical()
-            .id_salt("ignored_panel")
+        if filtered_conflicts.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new("No conflicts found!").size(24.0))
+                        .selectable(false),
+                );
+            });
+            return;
+        }
+
+        filtered_conflicts.sort_by(|a, b| a.0.cmp(&b.0));
+
+        egui::ScrollArea::both()
+            .id_salt("results_panel")
             .auto_shrink(false)
             .show(ui, |ui| {
-                let mut ignored: Vec<_> = self.config.ignored.iter().collect();
-                ignored.sort_by(|a, b| a.0.cmp(b.0));
-
-                for (key, paths) in ignored {
-                    egui::CollapsingHeader::new(
-                        egui::RichText::new(format!("{} ({})", key, paths.len()))
-                            .size(14.0)
-                            .color(egui::Color32::GRAY),
-                    )
-                    .show(ui, |ui| {
-                        egui::Frame::NONE
-                            .inner_margin(egui::Margin {
-                                left: 2,
-                                right: 16,
-                                top: 6,
-                                bottom: 8,
-                            })
-                            .show(ui, |ui| {
-                                // Restore button
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
-
-                                    if ui.button("Forget").clicked() {
-                                        self.pending_commands
-                                            .push(Command::UnignoreGroup(key.to_string()));
-                                    }
-                                });
-
-                                // File list
-                                ui.spacing_mut().item_spacing = egui::vec2(10.0, 4.0);
-
-                                for path in paths {
-                                    ui.horizontal(|ui| {
-                                        let mut display_text = format!(
-                                            "{}",
-                                            diff_paths(path, bioware_dir.clone())
-                                                .unwrap_or_else(|| path.clone())
-                                                .display()
-                                        );
-                                        if paths.last().is_some_and(|last_path| last_path == path) {
-                                            display_text.push_str(" ⭐");
-                                        }
-
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(display_text).size(12.0),
-                                            )
-                                            .selectable(false),
-                                        );
-                                    });
-                                }
-                            });
-                    });
+                for (key, paths) in filtered_conflicts {
+                    self.render_result_conflict(ui, &key, &paths, bioware_dir);
                 }
             });
     }
 
-    fn results_panel(&mut self, ui: &mut egui::Ui, bioware_dir: &PathBuf) {
-        egui::ScrollArea::vertical()
-            .id_salt("results_panel")
-            .auto_shrink(false)
-            .show(ui, |ui| {
-                let mut sorted_duplicates: Vec<_> = self
-                    .duplicates
-                    .iter()
-                    .filter(|(key, paths)| !self.is_group_ignored(key, paths))
-                    .collect();
-                sorted_duplicates.sort_by(|a, b| a.0.cmp(b.0));
+    fn render_result_conflict(
+        &mut self,
+        ui: &mut egui::Ui,
+        key: &str,
+        paths: &[PathBuf],
+        bioware_dir: &Path,
+    ) {
+        egui::CollapsingHeader::new(
+            egui::RichText::new(format!("{} ({})", key, paths.len())).size(14.0),
+        )
+        .show(ui, |ui| {
+            egui::Frame::new()
+                .inner_margin(egui::Margin {
+                    left: 2,
+                    right: 16,
+                    top: 6,
+                    bottom: 8,
+                })
+                .show(ui, |ui| {
+                    // Ignore button
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().button_padding = egui::vec2(6.0, 4.0);
 
-                for (key, paths) in sorted_duplicates {
-                    if paths.len() > 1 {
-                        egui::CollapsingHeader::new(
-                            egui::RichText::new(format!("{} ({})", key, paths.len())).size(14.0),
-                        )
-                        .show(ui, |ui| {
-                            egui::Frame::NONE
-                                .inner_margin(egui::Margin {
-                                    left: 2,
-                                    right: 16,
-                                    top: 6,
-                                    bottom: 8,
-                                })
-                                .show(ui, |ui| {
-                                    // Ignore button
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+                        if ui
+                            .add(egui::Button::new("Ignore").corner_radius(BUTTON_RADIUS))
+                            .clicked()
+                        {
+                            self.pending_commands
+                                .push(Command::IgnoreConflict(key.to_string(), paths.to_vec()));
+                        }
+                    });
+                    ui.add_space(4.0);
 
-                                        if ui.button("Ignore").clicked() {
-                                            self.pending_commands.push(Command::IgnoreGroup(
-                                                key.to_string(),
-                                                paths.clone(),
-                                            ));
-                                        }
-                                    });
-                                    ui.add_space(4.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 8.0);
+                    ui.spacing_mut().button_padding = egui::vec2(2.0, 1.0);
 
-                                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
-                                    ui.spacing_mut().button_padding = egui::vec2(2.0, 1.0);
-
-                                    // File list
-                                    for path in paths {
-                                        ui.horizontal(|ui| {
-                                            if ui
-                                                .add(egui::Button::new(
-                                                    egui::RichText::new("📂").size(16.0),
-                                                ))
-                                                .on_hover_text("Open location in Explorer")
-                                                .clicked()
-                                            {
-                                                let _ = open_location(path);
-                                            }
-
-                                            // Delete button (only for non-ERF files)
-                                            let is_erf =
-                                                path.extension().map_or(false, |ext| ext == "erf");
-                                            if ui
-                                                .add_enabled(
-                                                    !is_erf,
-                                                    egui::Button::new(
-                                                        egui::RichText::new("❌").size(16.0),
-                                                    ),
-                                                )
-                                                .on_hover_text("Delete file")
-                                                .clicked()
-                                            {
-                                            }
-
-                                            // Path display
-                                            let mut display_text = format!(
-                                                "{}",
-                                                diff_paths(path, bioware_dir.clone())
-                                                    .unwrap_or_else(|| path.clone())
-                                                    .display()
-                                            );
-                                            if paths
-                                                .last()
-                                                .is_some_and(|last_path| last_path == path)
-                                            {
-                                                display_text.push_str(" ⭐");
-                                            }
-
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(display_text).size(13.0),
-                                                )
-                                                .selectable(false),
-                                            );
-                                        });
-                                    }
-                                });
-                        });
+                    // File list
+                    for path in paths {
+                        self.render_result_conflict_path(
+                            ui,
+                            path,
+                            bioware_dir,
+                            key,
+                            paths.last().is_some_and(|p| p == path),
+                        );
                     }
-                }
-            });
+                });
+        });
+    }
+
+    fn render_result_conflict_path(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &Path,
+        bioware_dir: &Path,
+        key: &str,
+        is_last: bool,
+    ) {
+        ui.horizontal(|ui| {
+            // Open in Explorer button
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("📂").size(16.0))
+                        .corner_radius(BUTTON_RADIUS),
+                )
+                .on_hover_text("Open location in Explorer")
+                .clicked()
+            {
+                let _ = open_in_explorer(path);
+            }
+
+            // Delete button (only for non-ERF files)
+            let is_erf = path
+                .extension()
+                .map_or(false, |ext| ext.eq_ignore_ascii_case("erf"));
+            if ui
+                .add_enabled(
+                    !is_erf,
+                    egui::Button::new(egui::RichText::new("❌").size(16.0))
+                        .corner_radius(BUTTON_RADIUS),
+                )
+                .on_hover_text("Delete file")
+                .clicked()
+            {
+                self.pending_commands.push(Command::DeleteConflictFile(
+                    key.to_string(),
+                    path.to_path_buf(),
+                ));
+            }
+
+            // Path display
+            let display_path = diff_paths(path, bioware_dir)
+                .unwrap_or_else(|| path.to_path_buf())
+                .display()
+                .to_string();
+
+            let text = if is_last {
+                format!("{} ⭐", display_path)
+            } else {
+                display_path
+            };
+
+            ui.add(egui::Label::new(egui::RichText::new(text).size(13.0)).selectable(false));
+        });
+    }
+
+    fn ignored_panel(&mut self, ui: &mut egui::Ui, bioware_dir: &Path) {
+        let mut ignored_conflicts: Vec<_> = self
+            .config
+            .ignored
+            .iter()
+            .map(|(key, paths)| (key.clone(), paths.clone()))
+            .collect();
+        ignored_conflicts.sort_by(|a, b| a.0.cmp(&b.0));
+
+        egui::CollapsingHeader::new(
+            egui::RichText::new(format!("Ignored conflicts ({})", self.config.ignored.len()))
+                .size(18.0),
+        )
+        .show_unindented(ui, |ui| {
+            egui::ScrollArea::both()
+                .id_salt("ignored_panel")
+                .min_scrolled_height(200.0)
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    if ignored_conflicts.is_empty() {
+                        ui.centered_and_justified(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new("No ignored conflicts")
+                                        .color(egui::Color32::DARK_GRAY)
+                                        .size(16.0),
+                                )
+                                .selectable(false),
+                            );
+                        });
+                        return;
+                    }
+
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin {
+                            left: 12,
+                            right: 8,
+                            top: 4,
+                            bottom: 8,
+                        })
+                        .show(ui, |ui| {
+                            for (key, paths) in ignored_conflicts {
+                                self.render_ignored_conflict(ui, &key, &paths, bioware_dir);
+                            }
+                        });
+                });
+        });
+    }
+
+    fn render_ignored_conflict(
+        &mut self,
+        ui: &mut egui::Ui,
+        key: &str,
+        paths: &[PathBuf],
+        bioware_dir: &Path,
+    ) {
+        egui::CollapsingHeader::new(
+            egui::RichText::new(format!("{} ({})", key, paths.len())).size(14.0),
+        )
+        .show(ui, |ui| {
+            egui::Frame::new()
+                .inner_margin(egui::Margin {
+                    left: 2,
+                    right: 16,
+                    top: 6,
+                    bottom: 8,
+                })
+                .show(ui, |ui| {
+                    // Restore button
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().button_padding = egui::vec2(6.0, 4.0);
+
+                        if ui
+                            .add(egui::Button::new("Forget").corner_radius(BUTTON_RADIUS))
+                            .clicked()
+                        {
+                            self.pending_commands
+                                .push(Command::UnignoreConflict(key.to_string()));
+                        }
+                    });
+
+                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 4.0);
+
+                    for path in paths {
+                        self.render_ignored_conflict_path(
+                            ui,
+                            path,
+                            bioware_dir,
+                            paths.last().is_some_and(|p| p == path),
+                        );
+                    }
+                });
+        });
+    }
+
+    fn render_ignored_conflict_path(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &Path,
+        bioware_dir: &Path,
+        is_last: bool,
+    ) {
+        ui.horizontal(|ui| {
+            // Path display
+            let display_path = diff_paths(path, bioware_dir)
+                .unwrap_or_else(|| path.to_path_buf())
+                .display()
+                .to_string();
+
+            let text = if is_last {
+                format!("{} ⭐", display_path)
+            } else {
+                display_path
+            };
+
+            ui.add(egui::Label::new(egui::RichText::new(text).size(12.0)).selectable(false));
+        });
     }
 }
 
@@ -371,7 +468,7 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 if let Some(bioware_dir) = get_bioware_dir() {
                     if bioware_dir.exists() {
-                        self.main_ui(ui, bioware_dir);
+                        self.main_ui(ui, &bioware_dir);
                         return;
                     }
                 };
@@ -379,7 +476,15 @@ impl eframe::App for App {
             });
 
         if let Err(e) = self.handle_commands() {
-            self.status = format!("Config error: {}", e);
+            self.status = format!("Command error: {}", e);
         }
     }
+}
+
+fn get_bioware_dir() -> Option<PathBuf> {
+    UserDirs::new()?
+        .document_dir()?
+        .join("BioWare/Dragon Age")
+        .canonicalize()
+        .ok()
 }

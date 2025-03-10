@@ -1,10 +1,14 @@
-use std::io;
-use std::path::PathBuf;
-use std::{path::Path, process::Command};
+use std::fs;
+use std::io::Result as IoResult;
+use std::path::Path;
+use std::process::Command;
 
-use directories::UserDirs;
+pub fn delete(path: &Path) -> IoResult<()> {
+    fs::remove_file(path)
+}
 
-pub fn open_location(path: &Path) -> io::Result<()> {
+// FIX: rarely works
+pub fn open_in_explorer(path: &Path) -> IoResult<()> {
     let absolute_path = path.canonicalize()?;
     let path_str = absolute_path
         .display()
@@ -17,8 +21,4 @@ pub fn open_location(path: &Path) -> io::Result<()> {
         .spawn()?;
 
     Ok(())
-}
-
-pub fn get_bioware_dir() -> Option<PathBuf> {
-    Some(UserDirs::new()?.document_dir()?.join("BioWare/Dragon Age"))
 }
