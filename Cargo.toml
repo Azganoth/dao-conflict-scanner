@@ -11,8 +11,6 @@ eframe = "0.31"
 anyhow = "1.0"
 thiserror = "2.0"
 directories = "6.0"
-rfd = "0.15"
-indexmap = "2.8"
 walkdir = "2.5"
 pathdiff = "0.2"
 serde = { version = "1.0", features = ["derive"] }
