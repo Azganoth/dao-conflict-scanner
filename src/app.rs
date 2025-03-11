@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::{mem, thread};
@@ -30,6 +31,7 @@ pub struct App {
     scan_thread: Option<thread::JoinHandle<()>>,
     receiver: Option<mpsc::Receiver<Result<Conflicts, ScanError>>>,
     pending_commands: Vec<Command>,
+    expanded_conflicts: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -50,6 +52,7 @@ impl App {
             scan_thread: None,
             receiver: None,
             pending_commands: Vec::new(),
+            expanded_conflicts: HashSet::new(),
         }
     }
 
@@ -82,6 +85,8 @@ impl App {
                                 .get(key)
                                 .map_or(false, |paths| paths == ignored_paths)
                         });
+                        self.expanded_conflicts
+                            .retain(|k| self.conflicts.contains_key(k));
 
                         self.status = format!("Found {} conflicts", self.conflicts.len());
 
@@ -132,6 +137,15 @@ impl App {
 
         self.config.save().context("Failed to save config")?;
         Ok(())
+    }
+
+    fn expand_all(&mut self) {
+        self.expanded_conflicts
+            .extend(self.conflicts.keys().into_iter().map(|k| k.to_string()));
+    }
+
+    fn collapse_all(&mut self) {
+        self.expanded_conflicts.clear();
     }
 }
 
@@ -195,6 +209,33 @@ impl App {
                     .size(14.0)
                     .color(egui::Color32::LIGHT_GRAY),
             );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().button_padding = egui::vec2(4.0, 2.0);
+
+                ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("⏷").size(12.0))
+                                .corner_radius(BUTTON_RADIUS),
+                        )
+                        .on_hover_text("Expand all conflicts")
+                        .clicked()
+                    {
+                        self.expand_all();
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("⏶").size(12.0))
+                                .corner_radius(BUTTON_RADIUS),
+                        )
+                        .on_hover_text("Collapse all conflicts")
+                        .clicked()
+                    {
+                        self.collapse_all();
+                    }
+                });
+            });
         });
     }
 
@@ -240,9 +281,12 @@ impl App {
         paths: &[PathBuf],
         bioware_dir: &Path,
     ) {
-        egui::CollapsingHeader::new(
+        let is_open = self.expanded_conflicts.contains(key);
+
+        let response = egui::CollapsingHeader::new(
             egui::RichText::new(format!("{} ({})", key, paths.len())).size(14.0),
         )
+        .open(Some(is_open))
         .show(ui, |ui| {
             egui::Frame::new()
                 .inner_margin(egui::Margin {
@@ -281,6 +325,14 @@ impl App {
                     }
                 });
         });
+
+        if response.header_response.clicked() {
+            if is_open {
+                self.expanded_conflicts.remove(key);
+            } else {
+                self.expanded_conflicts.insert(key.to_string());
+            }
+        }
     }
 
     fn render_result_conflict_path(
