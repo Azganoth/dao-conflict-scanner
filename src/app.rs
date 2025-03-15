@@ -26,12 +26,18 @@ fn setup_theme(ctx: &egui::Context) {
 pub struct App {
     config: AppConfig,
     conflicts: Conflicts,
-    status: String,
+    status: AppStatus,
 
     scan_thread: Option<thread::JoinHandle<()>>,
     receiver: Option<mpsc::Receiver<Result<Conflicts, ScanError>>>,
     pending_commands: Vec<Command>,
     expanded_conflicts: HashSet<String>,
+}
+
+#[derive(Debug)]
+enum AppStatus {
+    Info(String),
+    Error(String),
 }
 
 #[derive(Debug)]
@@ -48,7 +54,7 @@ impl App {
         Self {
             config: AppConfig::load(),
             conflicts: Conflicts::new(),
-            status: "".to_string(),
+            status: AppStatus::Info("".to_string()),
             scan_thread: None,
             receiver: None,
             pending_commands: Vec::new(),
@@ -68,7 +74,7 @@ impl App {
             });
         }));
 
-        self.status = "Scanning...".to_string();
+        self.status = AppStatus::Info("Scanning...".to_string());
         self.conflicts.clear();
     }
 
@@ -76,8 +82,8 @@ impl App {
         if let Some(receiver) = &self.receiver {
             if let Ok(result) = receiver.try_recv() {
                 match result {
-                    Ok(duplicates) => {
-                        self.conflicts = duplicates;
+                    Ok(conflicts) => {
+                        self.conflicts = conflicts;
 
                         // Remove old conflicts when new ones are found
                         self.config.ignored.retain(|key, ignored_paths| {
@@ -88,7 +94,8 @@ impl App {
                         self.expanded_conflicts
                             .retain(|k| self.conflicts.contains_key(k));
 
-                        self.status = format!("Found {} conflicts", self.conflicts.len());
+                        self.status =
+                            AppStatus::Info(format!("Found {} conflicts", self.conflicts.len()));
 
                         // Silently ignore
                         self.config.save().unwrap_or_else(|e| {
@@ -96,7 +103,7 @@ impl App {
                         });
                     }
                     Err(e) => {
-                        self.status = format!("Scan failed: {}", e);
+                        self.status = AppStatus::Error(format!("Scan failed: {}", e));
                     }
                 }
 
@@ -202,12 +209,17 @@ impl App {
                 self.start_scan(bioware_dir);
             }
 
+            let (status_text, status_color) = match &self.status {
+                AppStatus::Info(text) => (text, egui::Color32::LIGHT_GRAY),
+                AppStatus::Error(text) => (text, egui::Color32::RED),
+            };
+
             // Status label
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new(&self.status)
+                egui::RichText::new(status_text)
                     .size(14.0)
-                    .color(egui::Color32::LIGHT_GRAY),
+                    .color(status_color),
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -240,6 +252,10 @@ impl App {
     }
 
     fn results_panel(&mut self, ui: &mut egui::Ui, bioware_dir: &Path) {
+        if self.scan_thread.is_some() {
+            return;
+        }
+
         let mut filtered_conflicts: Vec<_> = self
             .conflicts
             .iter()
@@ -528,7 +544,7 @@ impl eframe::App for App {
             });
 
         if let Err(e) = self.handle_commands() {
-            self.status = format!("Command error: {}", e);
+            self.status = AppStatus::Error(format!("Command error: {}", e));
         }
     }
 }
