@@ -120,9 +120,7 @@ impl ErfFile {
 
             reader.read_exact(&mut entry_data)?;
 
-            let name = decode_utf16le(&entry_data[0..64])?
-                .trim_end_matches('\0')
-                .to_string();
+            let name = decode_utf16le(&entry_data[0..64])?;
 
             if name.is_empty() {
                 return Err(ErfError::InvalidResourceName(format!(
@@ -189,16 +187,15 @@ fn decode_utf16le(bytes: &[u8]) -> ErfResult<String> {
         return Err(ErfError::InvalidStringEncoding);
     }
 
-    let mut result = String::new();
+    let u16_values: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
 
-    for chunk in bytes.chunks_exact(2) {
-        let val = u16::from_le_bytes([chunk[0], chunk[1]]);
-        if val == 0 {
-            continue;
-        }
-
-        let c = char::from_u32(val as u32).ok_or(ErfError::InvalidStringEncoding)?;
-        result.push(c);
+    // Gracefully handle invalid UTF-16 sequences (critical for V2.2 compatibility)
+    let mut result = String::from_utf16_lossy(&u16_values);
+    if result.ends_with('\0') {
+        result.truncate(result.trim_end_matches('\0').len());
     }
 
     Ok(result)
