@@ -36,6 +36,7 @@ pub struct App {
     expanded_conflicts: HashSet<String>,
     scan_thread: Option<thread::JoinHandle<()>>,
     receiver: Option<mpsc::Receiver<Result<Conflicts, ScanError>>>,
+    has_scanned: bool,
 }
 
 #[derive(Debug)]
@@ -52,16 +53,18 @@ impl App {
         Self {
             config: AppConfig::load(),
             conflicts: Conflicts::new(),
-            status: "Idle".into(),
+            status: "Waiting for a scan...".into(),
             error: None,
             scan_thread: None,
             receiver: None,
             pending_commands: Vec::new(),
             expanded_conflicts: HashSet::new(),
+            has_scanned: false,
         }
     }
 
     fn start_scan(&mut self, bioware_dir: &Path) {
+        self.has_scanned = true;
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
 
@@ -286,7 +289,7 @@ impl App {
     }
 
     fn results_panel(&mut self, ui: &mut egui::Ui, bioware_dir: &Path) {
-        if self.scan_thread.is_some() {
+        if self.scan_thread.is_some() || !self.has_scanned {
             return;
         }
 
@@ -305,7 +308,7 @@ impl App {
         if filtered_conflicts.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.add(
-                    egui::Label::new(egui::RichText::new("No conflicts found!").size(24.0))
+                    egui::Label::new(egui::RichText::new("All conflicts resolved!").size(24.0))
                         .selectable(false),
                 );
             });
@@ -449,8 +452,11 @@ impl App {
         ignored_conflicts.sort_by(|a, b| a.0.cmp(&b.0));
 
         egui::CollapsingHeader::new(
-            egui::RichText::new(format!("Ignored conflicts ({})", self.config.ignored.len()))
-                .size(18.0),
+            egui::RichText::new(format!(
+                "Resolved conflicts ({})",
+                self.config.ignored.len()
+            ))
+            .size(18.0),
         )
         .show_unindented(ui, |ui| {
             egui::ScrollArea::both()
