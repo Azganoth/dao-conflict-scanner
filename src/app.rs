@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::{mem, thread};
 
-use anyhow::{Context, Result as AnyhowResult};
+use anyhow::{Context, Error as AnyhowError, Result as AnyhowResult};
 use directories::UserDirs;
 use eframe::egui;
 use pathdiff::diff_paths;
@@ -26,18 +26,13 @@ fn setup_theme(ctx: &egui::Context) {
 pub struct App {
     config: AppConfig,
     conflicts: Conflicts,
-    status: AppStatus,
+    status: String,
+    error: Option<AnyhowError>,
 
     scan_thread: Option<thread::JoinHandle<()>>,
     receiver: Option<mpsc::Receiver<Result<Conflicts, ScanError>>>,
     pending_commands: Vec<Command>,
     expanded_conflicts: HashSet<String>,
-}
-
-#[derive(Debug)]
-enum AppStatus {
-    Info(String),
-    Error(String),
 }
 
 #[derive(Debug)]
@@ -54,7 +49,8 @@ impl App {
         Self {
             config: AppConfig::load(),
             conflicts: Conflicts::new(),
-            status: AppStatus::Info("".to_string()),
+            status: "Idle".into(),
+            error: None,
             scan_thread: None,
             receiver: None,
             pending_commands: Vec::new(),
@@ -74,7 +70,7 @@ impl App {
             });
         }));
 
-        self.status = AppStatus::Info("Scanning...".to_string());
+        self.status = "Scanning...".into();
         self.conflicts.clear();
     }
 
@@ -94,8 +90,7 @@ impl App {
                         self.expanded_conflicts
                             .retain(|k| self.conflicts.contains_key(k));
 
-                        self.status =
-                            AppStatus::Info(format!("Found {} conflicts", self.conflicts.len()));
+                        self.status = format!("Found {} conflicts!", self.conflicts.len());
 
                         // Silently ignore
                         self.config.save().unwrap_or_else(|e| {
@@ -103,7 +98,8 @@ impl App {
                         });
                     }
                     Err(e) => {
-                        self.status = AppStatus::Error(format!("Scan failed: {}", e));
+                        self.status = "Scan failed!".into();
+                        self.error = Some(e.into());
                     }
                 }
 
@@ -172,6 +168,78 @@ impl App {
         );
     }
 
+    fn show_error_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(err) = &self.error {
+            let mut open = true;
+            let mut should_clear_error = false;
+
+            egui::Area::new(egui::Id::new("modal_overlay"))
+                .order(egui::Order::Background)
+                .show(ctx, |ui| {
+                    ui.painter().rect_filled(
+                        ui.ctx().screen_rect(),
+                        egui::CornerRadius::ZERO,
+                        egui::Color32::from_black_alpha(150),
+                    );
+                });
+
+            egui::Window::new("Error")
+                .open(&mut open)
+                .collapsible(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    egui::Frame::new().inner_margin(6.0).show(ui, |ui| {
+                        let errors: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+
+                        let message = errors.join("\n\n").replace(r"\\?\", ""); // Clean Windows extended path prefix
+
+                        egui::ScrollArea::vertical()
+                            .max_height(300.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(&message).size(14.0));
+                            });
+
+                        ui.add_space(7.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        ui.with_layout(
+                            egui::Layout::top_down_justified(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().button_padding = egui::vec2(6.0, 6.0);
+
+                                if ui
+                                    .add(
+                                        egui::Button::new(egui::RichText::new("Copy").size(14.0))
+                                            .corner_radius(BUTTON_RADIUS),
+                                    )
+                                    .clicked()
+                                {
+                                    ui.ctx().copy_text(message);
+                                }
+
+                                ui.add_space(6.0);
+
+                                if ui
+                                    .add(
+                                        egui::Button::new(egui::RichText::new("Close").size(14.0))
+                                            .corner_radius(BUTTON_RADIUS),
+                                    )
+                                    .clicked()
+                                {
+                                    should_clear_error = true;
+                                }
+                            },
+                        );
+                    });
+                });
+
+            if !open || should_clear_error {
+                self.error = None;
+            }
+        }
+    }
+
     fn main_ui(&mut self, ui: &mut egui::Ui, bioware_dir: &Path) {
         egui::TopBottomPanel::top("controls").show_inside(ui, |ui| {
             self.scan_controls(ui, bioware_dir);
@@ -209,18 +277,9 @@ impl App {
                 self.start_scan(bioware_dir);
             }
 
-            let (status_text, status_color) = match &self.status {
-                AppStatus::Info(text) => (text, egui::Color32::LIGHT_GRAY),
-                AppStatus::Error(text) => (text, egui::Color32::RED),
-            };
-
             // Status label
             ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(status_text)
-                    .size(14.0)
-                    .color(status_color),
-            );
+            ui.label(egui::RichText::new(&self.status).size(14.0));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().button_padding = egui::vec2(4.0, 2.0);
@@ -544,8 +603,10 @@ impl eframe::App for App {
             });
 
         if let Err(e) = self.handle_commands() {
-            self.status = AppStatus::Error(format!("Command error: {}", e));
+            self.error = Some(e);
         }
+
+        self.show_error_dialog(ctx);
     }
 }
 
