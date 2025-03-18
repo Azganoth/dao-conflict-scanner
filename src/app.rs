@@ -1,16 +1,20 @@
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::{mem, thread};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    {mem, thread},
+};
 
-use anyhow::{Context, Error as AnyhowError, Result as AnyhowResult};
+use anyhow::{Context, Error as AnyhowError, Result as AnyhowResult, anyhow};
 use directories::UserDirs;
 use eframe::egui;
 use pathdiff::diff_paths;
 
-use crate::config::AppConfig;
-use crate::scanner::{Conflicts, ScanError, scan_for_conflicts};
-use crate::utils::{delete, open_in_explorer};
+use crate::{
+    config::AppConfig,
+    scanner::{Conflicts, ScanError, scan_for_conflicts},
+    utils::{delete, open_in_explorer},
+};
 
 const BUTTON_RADIUS: f32 = 3.0;
 
@@ -28,11 +32,10 @@ pub struct App {
     conflicts: Conflicts,
     status: String,
     error: Option<AnyhowError>,
-
-    scan_thread: Option<thread::JoinHandle<()>>,
-    receiver: Option<mpsc::Receiver<Result<Conflicts, ScanError>>>,
     pending_commands: Vec<Command>,
     expanded_conflicts: HashSet<String>,
+    scan_thread: Option<thread::JoinHandle<()>>,
+    receiver: Option<mpsc::Receiver<Result<Conflicts, ScanError>>>,
 }
 
 #[derive(Debug)]
@@ -65,9 +68,7 @@ impl App {
         let game_dir = bioware_dir.to_path_buf();
         self.scan_thread = Some(thread::spawn(move || {
             let result = scan_for_conflicts(&game_dir);
-            tx.send(result).unwrap_or_else(|e| {
-                eprintln!("Failed to send scan result: {}", e);
-            });
+            let _ = tx.send(result);
         }));
 
         self.status = "Scanning...".into();
@@ -92,10 +93,7 @@ impl App {
 
                         self.status = format!("Found {} conflicts!", self.conflicts.len());
 
-                        // Silently ignore
-                        self.config.save().unwrap_or_else(|e| {
-                            eprintln!("Config error: {}", e);
-                        });
+                        let _ = self.config.save();
                     }
                     Err(e) => {
                         self.status = "Scan failed!".into();
@@ -103,19 +101,14 @@ impl App {
                     }
                 }
 
-                // Reset scan state
-                self.receiver.take();
-                self.scan_thread.take();
+                self.receiver = None;
+                self.scan_thread = None;
             }
         }
     }
 
     fn handle_commands(&mut self) -> AnyhowResult<()> {
         let commands = mem::take(&mut self.pending_commands);
-        if commands.is_empty() {
-            return Ok(());
-        }
-
         for command in commands {
             match command {
                 Command::IgnoreConflict(key, paths) => {
@@ -127,7 +120,6 @@ impl App {
                 Command::DeleteConflictFile(key, path) => {
                     delete(&path).context(format!("Failed to delete {}", path.display()))?;
 
-                    // Update conflicts
                     if let Some(paths) = self.conflicts.get_mut(&key) {
                         paths.retain(|p| p != &path);
                         if paths.is_empty() {
@@ -143,8 +135,7 @@ impl App {
     }
 
     fn expand_all(&mut self) {
-        self.expanded_conflicts
-            .extend(self.conflicts.keys().into_iter().map(|k| k.to_string()));
+        self.expanded_conflicts = self.conflicts.keys().cloned().collect();
     }
 
     fn collapse_all(&mut self) {
@@ -153,21 +144,6 @@ impl App {
 }
 
 impl App {
-    fn not_found_ui(&self, ui: &mut egui::Ui) {
-        ui.with_layout(
-            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-            |ui| {
-                ui.add(egui::Label::new(
-                    egui::RichText::new(
-                        "'Documents/BioWare/Dragon Age' folder is missing, make sure it exists.",
-                    )
-                    .size(24.0)
-                    .color(egui::Color32::RED),
-                ).wrap());
-            },
-        );
-    }
-
     fn show_error_dialog(&mut self, ctx: &egui::Context) {
         if let Some(err) = &self.error {
             let mut open = true;
@@ -277,7 +253,6 @@ impl App {
                 self.start_scan(bioware_dir);
             }
 
-            // Status label
             ui.add_space(4.0);
             ui.label(egui::RichText::new(&self.status).size(14.0));
 
@@ -388,7 +363,6 @@ impl App {
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 8.0);
                     ui.spacing_mut().button_padding = egui::vec2(2.0, 1.0);
 
-                    // File list
                     for path in paths {
                         self.render_result_conflict_path(
                             ui,
@@ -450,7 +424,6 @@ impl App {
                 ));
             }
 
-            // Path display
             let display_path = diff_paths(path, bioware_dir)
                 .unwrap_or_else(|| path.to_path_buf())
                 .display()
@@ -569,7 +542,6 @@ impl App {
         is_last: bool,
     ) {
         ui.horizontal(|ui| {
-            // Path display
             let display_path = diff_paths(path, bioware_dir)
                 .unwrap_or_else(|| path.to_path_buf())
                 .display()
@@ -592,14 +564,16 @@ impl eframe::App for App {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(12.0))
-            .show(ctx, |ui| {
-                if let Some(bioware_dir) = get_bioware_dir() {
-                    if bioware_dir.exists() {
-                        self.main_ui(ui, &bioware_dir);
-                        return;
-                    }
-                };
-                self.not_found_ui(ui);
+            .show(ctx, |ui| match get_bioware_dir() {
+                Some(bioware_dir) if bioware_dir.exists() => {
+                    self.main_ui(ui, &bioware_dir);
+                }
+                _ => {
+                    self.error = anyhow!(
+                        "'Documents/BioWare/Dragon Age' folder is missing, make sure it exists."
+                    )
+                    .into();
+                }
             });
 
         if let Err(e) = self.handle_commands() {

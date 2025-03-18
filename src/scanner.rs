@@ -23,33 +23,34 @@ pub enum ScanError {
 
 pub type Conflicts = HashMap<String, Vec<PathBuf>>;
 
-/// Scans a BioWare directory for file conflicts.
-/// Returns a map where keys are duplicate file/resource names and values are lists of file paths.
 pub fn scan_for_conflicts(bioware_dir: &Path) -> Result<Conflicts, ScanError> {
     let mut conflicts = Conflicts::new();
     let override_dir = bioware_dir.join("packages/core/override");
 
-    for entry in WalkDir::new(bioware_dir)
+    WalkDir::new(bioware_dir)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
-    {
-        let path = entry.path();
+        .for_each(|entry| {
+            let path = entry.path();
 
-        if path.starts_with(&override_dir) {
-            process_loose_file(path, &mut conflicts);
-        } else if path
-            .extension()
-            .map_or(false, |ext| ext.eq_ignore_ascii_case("erf"))
-        {
-            process_erf_file(path, &mut conflicts)?;
-        }
-    }
+            if path.starts_with(&override_dir) {
+                process_loose_file(path, &mut conflicts);
+            } else if is_erf_file(path) {
+                if let Err(err) = process_erf_file(path, &mut conflicts) {
+                    eprintln!(
+                        "Warning: Failed to process ERF file {}: {}",
+                        path.display(),
+                        err
+                    );
+                }
+            }
+        });
 
     conflicts.retain(|key, paths| paths.len() > 1 && !should_ignore(key));
 
-    for p in conflicts.values_mut() {
-        p.sort();
+    for paths in conflicts.values_mut() {
+        paths.sort();
     }
 
     Ok(conflicts)
@@ -62,6 +63,11 @@ fn process_loose_file(path: &Path, conflicts: &mut Conflicts) {
             .or_default()
             .push(path.to_path_buf());
     }
+}
+
+fn is_erf_file(path: &Path) -> bool {
+    path.extension()
+        .map_or(false, |ext| ext.eq_ignore_ascii_case("erf"))
 }
 
 fn process_erf_file(path: &Path, conflicts: &mut Conflicts) -> Result<(), ScanError> {
